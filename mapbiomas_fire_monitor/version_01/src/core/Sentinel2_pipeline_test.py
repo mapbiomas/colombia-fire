@@ -549,18 +549,18 @@ def _item_datetime(item: Item) -> str:
     return item.datetime.isoformat().replace("+00:00", "Z")
 
 
-def search_scenes(config: PipelineConfig, tile: gpd.GeoDataFrame) -> SearchResult:
+def search_scenes(config: PipelineConfig, tile: gpd.GeoDataFrame, *, filter_cloud_cover: bool = True) -> SearchResult:
     """Busca escenas, elimina versiones duplicadas de procesamiento y ordena la selección."""
     if date.fromisoformat(config.start_date) > date.fromisoformat(config.end_date):
         raise ValueError("La fecha inicial debe ser anterior o igual a la fecha final.")
-    if not 0 <= config.max_cloud_cover <= 100:
+    if filter_cloud_cover and not 0 <= config.max_cloud_cover <= 100:
         raise ValueError("Indique nubosidad entre 0 y 100.")
     if config.collection not in {"sentinel-2-l2a", "sentinel-2-c1-l2a"}:
         raise ValueError("Use una colección Sentinel-2 L2A para obtener reflectancia de superficie.")
     retry = _retry_policy()
     geometry = tile.geometry.iloc[0]
     catalog = Client.open(config.stac_url, stac_io=StacApiIO(timeout=60, max_retries=retry))
-    consulta = {"eo:cloud_cover": {"lte": config.max_cloud_cover}}
+    consulta = {"eo:cloud_cover": {"lte": config.max_cloud_cover}} if filter_cloud_cover else {}
     if config.region_id is None:
         consulta.update({"s2:mgrs_tile": {"eq": config.tile_name}} if config.source == "planetary-computer" else {
             "mgrs:utm_zone": {"eq": int(config.tile_name[:2])},
@@ -1920,6 +1920,43 @@ class NotebookWorkflow:
     def load_vectors(self, tiles_id: str, regions_id: str, *, authenticate: bool = False):
         self.tiles_path = descargar_vector_drive(tiles_id, self.tiles_path, authenticate)
         self.regions_path = descargar_vector_drive(regions_id, self.regions_path, authenticate)
+
+    def load_gee_vectors(self, parameters: dict):
+        """Read the selected region and intersecting tiles from GEE, caching GeoJSON locally."""
+        import ee
+        key = json.dumps({k: parameters[k] for k in ('regions_asset', 'tiles_asset', 'region_id')}, sort_keys=True)
+        if (getattr(self, '_gee_vectors_key', None) == key
+                and self.regions_path.is_file() and self.tiles_path.is_file()):
+            return
+        regions = ee.FeatureCollection(parameters['regions_asset']).filter(
+            ee.Filter.eq('id_monitor', parameters['region_id']))
+        region_data = regions.getInfo()
+        features = region_data.get('features', [])
+        if len(features) != 1 or not features[0].get('geometry'):
+            raise ValueError('GEE debe devolver exactamente una región con geometría para ese id_monitor.')
+        props = features[0].setdefault('properties', {})
+        props['id_monitor'] = parameters['region_id']
+        props.setdefault('nombre', props.get('LEVEL_3') or f"Región {parameters['region_id']}")
+        tiles = ee.FeatureCollection(parameters['tiles_asset']).filterBounds(regions.geometry()).getInfo()
+        if not tiles.get('features'):
+            raise ValueError('El índice de GEE no contiene teselas que intersecten la región.')
+        for feature in tiles['features']:
+            props = feature.setdefault('properties', {})
+            if not props.get('Name'):
+                name = next((props[k] for k in ('MGRS_TILE', 'name', 'tile', 'system:index') if props.get(k)), feature.get('id'))
+                if not name:
+                    raise ValueError('Una tesela GEE no tiene identificador Name/MGRS_TILE.')
+                props['Name'] = str(name)
+        tag = hashlib.sha256(key.encode()).hexdigest()[:12]
+        self.vectors_dir.mkdir(parents=True, exist_ok=True)
+        region_path = self.vectors_dir / f'region_gee_{tag}.geojson'
+        tiles_path = self.vectors_dir / f'tiles_gee_{tag}.geojson'
+        for path, data in ((region_path, region_data), (tiles_path, tiles)):
+            temporary = path.with_suffix('.geojson.tmp')
+            temporary.write_text(json.dumps(data))
+            temporary.replace(path)
+        self.regions_path, self.tiles_path = region_path, tiles_path
+        self._gee_vectors_key = key
 
     def use_drive(self, folder: Path | str, *, mount: bool = True):
         """Configura la carpeta persistente; el procesamiento continúa en disco temporal."""
