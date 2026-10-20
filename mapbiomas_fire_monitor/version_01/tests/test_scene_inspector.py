@@ -4,6 +4,7 @@ import ast
 import contextlib
 import io
 from datetime import date
+import json
 import importlib.util
 from pathlib import Path
 import sys
@@ -14,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 CORE = Path(__file__).resolve().parents[1] / 'src/core'
 sys.path.insert(0, str(CORE))
-from M_scene_inspector import DOWNLOAD_BANDS, SceneInspectionSession, SceneInspectorUI, MonthlyDownloadUI, match_selected_scenes, filter_blocklisted_scenes, download_month
+from M_scene_inspector import DOWNLOAD_BANDS, SceneInspectionSession, SceneInspectorUI, MonthlyDownloadUI, match_selected_scenes, filter_blocklisted_scenes, download_month, archive_download_result, copy_debug_file
 
 
 class SceneInspectorTests(unittest.TestCase):
@@ -32,7 +33,8 @@ class SceneInspectorTests(unittest.TestCase):
         self.params = {'region_id': 7, 'regions_asset': 'regions', 'start_date': '2026-01-01',
                        'end_date': '2026-02-01'}
         self.workflow = types.SimpleNamespace(tiles_path=Path('tiles.zip'), regions_path=Path('regions.zip'),
-                                             results_dir=Path('results'), load_gee_vectors=MagicMock())
+                                             results_dir=Path('results'), archive_dir=Path('drive-results'),
+                                             load_gee_vectors=MagicMock())
         self.session = SceneInspectionSession(self.workflow, self.params)
         self.time = int(datetime(2026, 1, 12, 15, 30, tzinfo=timezone.utc).timestamp() * 1000)
         self.row = {'id': 'COPERNICUS/S2_SR_HARMONIZED/scene1', 'tile': '18NZL',
@@ -137,7 +139,7 @@ class SceneInspectorTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *args): return False
         widgets = types.SimpleNamespace(**{name: Widget for name in (
-            'Dropdown', 'Button', 'Output', 'VBox', 'HBox', 'HTML', 'Checkbox', 'Layout')})
+            'Dropdown', 'Button', 'Output', 'VBox', 'HBox', 'HTML', 'Checkbox', 'IntText', 'Layout')})
         p = patch.dict(sys.modules, {'ipywidgets': widgets})
         p.start()
         self.addCleanup(p.stop)
@@ -287,9 +289,78 @@ class SceneInspectorTests(unittest.TestCase):
             download.assert_called_once_with(self.workflow, {
                 'regions_asset': 'regions', 'tiles_asset': 'tiles', 'region_id': 8,
                 'start_date': '2026-12-01', 'end_date': '2027-01-01',
-            }, source='earth-search', test_mode=True)
+            }, source='earth-search', test_mode=True, max_scenes=10,
+               debug_drive_dir=Path('drive-results/debug_scenes/earth-search/region_8/2026-12'))
             self.assertIs(ui.result, download.return_value)
             self.assertFalse(ui.download_button.disabled)
+
+    def test_debug_limit_is_applied_after_blocklist(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenes, items, blocklists = self.monthly_fixture(root)
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}), \
+                 patch.object(SceneInspectionSession, 'inspect', return_value=scenes), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = download_month(self.workflow, self.params, test_mode=True, max_scenes=3)
+            self.assertEqual(self.pipeline.download_scenes.call_args.args[1], items[2:5])
+            self.assertEqual(report['max_scenes'], 3)
+
+    def test_invalid_debug_limit_stops_before_remote_requests(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, blocklists = self.monthly_fixture(root)
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}):
+                for limit in (0, -1, True, 1.5):
+                    with self.assertRaises(ValueError):
+                        download_month(self.workflow, self.params, test_mode=True, max_scenes=limit)
+            blocklists.refresh_blocklists.assert_not_called()
+            self.pipeline.download_scenes.assert_not_called()
+
+    def test_normal_mode_ignores_debug_limit_and_drive_archive(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenes, items, blocklists = self.monthly_fixture(root)
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}), \
+                 patch.object(SceneInspectionSession, 'inspect', return_value=scenes), \
+                 patch('M_scene_inspector.archive_download_result') as archive, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = download_month(self.workflow, self.params, max_scenes=1, debug_drive_dir=Path(root)/'drive')
+            self.assertEqual(self.pipeline.download_scenes.call_args.args[1], items[2:])
+            self.assertIsNone(report['debug_drive_dir'])
+            archive.assert_not_called()
+
+    def test_menu_passes_custom_count_and_disables_limit_outside_debug(self):
+        ui = self.make_monthly_ui()
+        ui.scene_limit.value = 4
+        with patch('M_scene_inspector.download_month', return_value={'result': None}) as download:
+            ui._download()
+        self.assertEqual(download.call_args.kwargs['max_scenes'], 4)
+        ui.test_mode.value = False
+        ui._debug_changed()
+        self.assertTrue(ui.scene_limit.disabled)
+
+    def test_archive_preserves_native_bands_and_calibration_without_signed_urls(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source = root/'source.tif'
+            source.write_bytes(b'native raster bytes')
+            result = types.SimpleNamespace(paths={'scene': {'nir': source}}, manifest=[{
+                'item_id': 'scene', 'asset': 'nir', 'source_url': 'https://signed.example',
+                'raster_bands': [{'scale': .0001, 'offset': -.1}]}])
+            archived = archive_download_result(result, root/'drive')
+            self.assertEqual(Path(archived['scene']['nir']).read_bytes(), source.read_bytes())
+            manifest = json.loads((root/'drive/download_manifest.json').read_text())
+            self.assertNotIn('source_url', manifest[0])
+            self.assertEqual(manifest[0]['raster_bands'], result.manifest[0]['raster_bands'])
+            self.assertEqual(manifest[0]['path'], 'scenes/scene/nir.tif')
+
+    def test_interrupted_archive_preserves_previous_copy(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, dest = Path(root)/'new', Path(root)/'saved'
+            source.write_bytes(b'new raster')
+            dest.write_bytes(b'previous raster')
+            with patch('shutil.copy2', side_effect=OSError('interrupted')):
+                with self.assertRaises(OSError):
+                    copy_debug_file(source, dest)
+            self.assertEqual(dest.read_bytes(), b'previous raster')
+            self.assertFalse(Path(str(dest)+'.partial').exists())
 
     def test_processing_snapshot_is_unchanged_when_menu_options_change(self):
         ui = self.make_monthly_ui()

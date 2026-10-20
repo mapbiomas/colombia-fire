@@ -139,25 +139,66 @@ class CloudMaskComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'L1C'):
             self.process()
 
-    def test_debug_grid_has_three_rows_ten_columns_and_saves_png(self):
+    def test_debug_grid_has_one_row_per_scene_and_three_columns(self):
         import matplotlib.pyplot as plt
         output = self.process()
         path = self.root/'comparison.png'
-        with patch.object(plt, 'show'):
-            figure = comparison.plot_comparison(output['scenes'], path)
-        self.addCleanup(plt.close, figure)
-        self.assertEqual(len(figure.axes), 30)
-        self.assertTrue(path.is_file())
-        self.assertEqual(len(figure.axes[0].images), 1)
-        self.assertEqual(len(figure.axes[10].images), 1)
-        self.assertEqual(len(figure.axes[20].images), 1)
-        self.assertEqual(len(figure.axes[1].images), 0)  # no duplicate scenes in empty columns
+        for count in (1, 3):
+            records = [dict(output['scenes'][0], scene_id=f'scene{i}') for i in range(count)]
+            with patch.object(plt, 'show'):
+                figure = comparison.plot_comparison(records, path)
+            self.assertEqual(len(figure.axes), count * 3)
+            self.assertEqual(figure.axes[0].get_subplotspec().get_gridspec().get_geometry(), (count, 3))
+            self.assertTrue(path.is_file())
+            self.assertTrue(all(len(axis.images) == 1 for axis in figure.axes))
+            self.assertIn('Original', figure.axes[0].get_title())
+            self.assertIn('SCL', figure.axes[1].get_title())
+            self.assertIn('CloudSEN12', figure.axes[2].get_title())
 
     def test_debug_flag_calls_the_grid_only_when_enabled(self):
         with patch.object(comparison, 'plot_comparison') as plot:
             output = self.process(debug=True)
         plot.assert_called_once()
-        self.assertTrue(output['figure_path'].endswith('cloud_mask_comparison_3x10.png'))
+        self.assertTrue(output['figure_path'].endswith('cloud_mask_comparison_escenas_x3.png'))
+
+    def test_debug_archives_raw_bands_masks_individual_plot_and_metrics_in_drive(self):
+        import matplotlib.pyplot as plt
+        drive = self.root/'drive'
+        self.download['debug_drive_dir'] = str(drive)
+        with patch.object(plt, 'show'):
+            output = self.process(debug=True)
+        self.assertEqual(output['drive_dir'], str(drive))
+        self.assertEqual(len(list((drive/'scenes/scene').glob('*.tif'))), 13)
+        saved = json.loads((drive/'cloud_masks/scene/cloud_masks.json').read_text())
+        for key in ('model_path', 'scl_path', 'individual_comparison_path'):
+            self.assertTrue(Path(saved[key]).is_file())
+            self.assertTrue(Path(saved[key]).is_relative_to(drive))
+        for path in saved['spectral_paths'].values():
+            self.assertTrue(Path(path).is_file())
+            self.assertTrue(Path(path).is_relative_to(drive))
+        for name in ('debug_processing.json', 'download_manifest.json',
+                     'cloud_mask_comparison_escenas_x3.png', 'resource_usage.json',
+                     'resource_usage.csv', 'resource_comparison.csv'):
+            self.assertTrue((drive/name).is_file(), name)
+
+    def test_non_debug_does_not_create_drive_archive(self):
+        drive = self.root/'drive'
+        self.process(debug=False, debug_drive_dir=drive)
+        self.assertFalse(drive.exists())
+        self.assertFalse((self.root/'out/scene/comparison.png').exists())
+
+    def test_debug_includes_all_scenes_in_one_comparison(self):
+        record = self.process()['scenes'][0]
+        self.download['result'].paths = {f'scene{i}': self.paths for i in range(11)}
+        with patch.object(comparison, 'process_scene', side_effect=[
+                dict(record, scene_id=f'scene{i}') for i in range(11)]), \
+             patch.object(comparison, 'save_individual_comparison', return_value='individual.png') as individual, \
+             patch.object(comparison, 'plot_comparison') as plot:
+            output = self.process(debug=True)
+        self.assertEqual(individual.call_count, 11)
+        self.assertEqual([len(call.args[0]) for call in plot.call_args_list], [11])
+        self.assertEqual(len(output['figure_paths']), 1)
+        self.assertTrue(output['figure_paths'][0].endswith('_escenas_x3.png'))
 
     def test_processing_uses_the_selected_region_geometry(self):
         from rasterio.warp import transform_geom

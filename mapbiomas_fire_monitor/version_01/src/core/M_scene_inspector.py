@@ -289,11 +289,51 @@ def filter_blocklisted_scenes(scenes, blocked_ids):
     return allowed, excluded
 
 
-def download_month(workflow, parameters, *, source='planetary-computer', test_mode=False):
-    """Download a region/month after blocklist checks; test mode caps allowed scenes at ten."""
+def copy_debug_file(source, destination):
+    """Atomically copy a debug artifact, reusing an unchanged complete copy."""
+    import shutil
+    source, destination = Path(source), Path(destination)
+    if source.resolve() == destination.resolve():
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file() and (source.stat().st_size, source.stat().st_mtime_ns) == (
+            destination.stat().st_size, destination.stat().st_mtime_ns):
+        return destination
+    temporary = destination.with_name(destination.name + '.partial')
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def archive_download_result(result, drive_dir):
+    """Preserve each scene's native bands and calibration metadata in Drive."""
+    drive_dir = Path(drive_dir)
+    archived = {}
+    for scene_id, paths in result.paths.items():
+        if Path(scene_id).name != scene_id or scene_id in ('', '.', '..'):
+            raise ValueError('Identificador de escena inválido para el archivo debug.')
+        print(f'Guardando escena en Drive: {scene_id}')
+        archived[scene_id] = {asset: str(copy_debug_file(path, drive_dir/'scenes'/scene_id/f'{asset}.tif'))
+                              for asset, path in paths.items()}
+    manifest = [{key: value for key, value in record.items() if key != 'source_url'} for record in result.manifest]
+    for record in manifest:
+        record['path'] = f"scenes/{record['item_id']}/{record['asset']}.tif"
+    drive_dir.mkdir(parents=True, exist_ok=True)
+    (drive_dir/'download_manifest.json').write_text(json.dumps(manifest, indent=2))
+    return archived
+
+
+def download_month(workflow, parameters, *, source='planetary-computer', test_mode=False,
+                   max_scenes=10, debug_drive_dir=None):
+    """Download a month; debug limits the scene count and optionally archives native files."""
     import M_blocklist as blocklists
     from Sentinel2_pipeline_test import PipelineConfig, select_region, search_scenes, download_scenes
 
+    if test_mode and (not isinstance(max_scenes, int) or isinstance(max_scenes, bool) or max_scenes < 1):
+        raise ValueError('El número de escenas debug debe ser un entero mayor que cero.')
     print('Consultando blocklist Sentinel-2…')
     blocked_ids = blocklists.refresh_blocklists(['sentinel2'])['sentinel2']
     report = blocklists.blocklist_report(['sentinel2'])['sentinel2']
@@ -312,7 +352,9 @@ def download_month(workflow, parameters, *, source='planetary-computer', test_mo
     for row in excluded:
         print(f"BLOCKLIST — {row['id']} (entrada: {row['blocklist_id']})")
     summary = {'source': source, 'test_mode': bool(test_mode), 'excluded': excluded,
-               'unavailable': [], 'selected': [], 'result': None}
+               'unavailable': [], 'selected': [], 'result': None,
+               'max_scenes': max_scenes if test_mode else None,
+               'debug_drive_dir': str(debug_drive_dir) if test_mode and debug_drive_dir else None}
     if not allowed:
         print('No hay escenas permitidas para descargar.')
         return summary
@@ -328,7 +370,7 @@ def download_month(workflow, parameters, *, source='planetary-computer', test_mo
     region = select_region(config)
     available = search_scenes(config, region.region, filter_cloud_cover=False)
     chosen, seen = [], set()
-    # Stable chronological order makes the ten-scene test repeatable.
+    # Stable chronological order makes the limited debug download repeatable.
     for scene in sorted(allowed, key=lambda row: (row['time'], row['id'])):
         try:
             item, = match_selected_scenes([scene], available.items)
@@ -341,9 +383,10 @@ def download_month(workflow, parameters, *, source='planetary-computer', test_mo
         seen.add(item.id)
         chosen.append(item)
         summary['selected'].append({'gee_id': scene['id'], 'stac_id': item.id})
-        if test_mode and len(chosen) == 10:
+        if test_mode and len(chosen) == max_scenes:
             break
-    print(f"Modo de prueba: {'ACTIVADO (máximo 10 escenas)' if test_mode else 'DESACTIVADO (todas las permitidas)'}. "
+    mode = f'ACTIVADO (máximo {max_scenes} escenas)' if test_mode else 'DESACTIVADO (todas las permitidas)'
+    print(f"Debug: {mode}. "
           f'Escenas a descargar: {len(chosen)}.')
     config.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = {key: value for key, value in summary.items() if key != 'result'}
@@ -352,6 +395,11 @@ def download_month(workflow, parameters, *, source='planetary-computer', test_mo
     (config.output_dir / 'monthly_download_selection.json').write_text(json.dumps(manifest, indent=2))
     if chosen:
         summary['result'] = download_scenes(config, chosen)
+        if summary['debug_drive_dir']:
+            summary['drive_paths'] = archive_download_result(summary['result'], debug_drive_dir)
+            copy_debug_file(config.output_dir/'monthly_download_selection.json',
+                            Path(debug_drive_dir)/'monthly_download_selection.json')
+            print(f'Escenas debug guardadas en Drive: {debug_drive_dir}')
         print(f'Descarga terminada. Directorio: {config.output_dir}')
     else:
         print('Ninguna escena permitida está disponible en la fuente elegida.')
@@ -399,7 +447,8 @@ class MonthlyDownloadUI:
         self.source = widgets.Dropdown(options=[('Planetary Computer', 'planetary-computer'),
                                                 ('Earth Search', 'earth-search')],
                                        value='planetary-computer', description='Fuente:')
-        self.test_mode = widgets.Checkbox(value=True, description='Modo de prueba: máximo 10 escenas', indent=False)
+        self.test_mode = widgets.Checkbox(value=True, description='Debug: limitar escenas y guardar en Drive', indent=False)
+        self.scene_limit = widgets.IntText(value=10, description='N.º escenas:')
         self.download_button = widgets.Button(description='Descargar', icon='download', button_style='success')
         self.output = widgets.Output()
         self.status = widgets.HTML('Seleccione región, año, mes y fuente. Pulse Descargar para empezar.')
@@ -407,9 +456,14 @@ class MonthlyDownloadUI:
             widgets.HTML('<h3 style="color:#185c44;margin:0">Descargar escenas del mes</h3>'),
             self.region, widgets.HBox([self.year, self.month, self.source],
                                       layout=widgets.Layout(flex_flow='row wrap')),
-            self.test_mode, self.download_button, self.status, self.output,
+            widgets.HBox([self.test_mode, self.scene_limit], layout=widgets.Layout(flex_flow='row wrap')),
+            self.download_button, self.status, self.output,
         ], layout=widgets.Layout(border='1px solid #cbded5', padding='18px', width='100%'))
         self.download_button.on_click(self._download)
+        self.test_mode.observe(lambda _: self._debug_changed(), names='value')
+
+    def _debug_changed(self):
+        self.scene_limit.disabled = not self.test_mode.value
 
     def parameters(self):
         year, month = self.year.value, self.month.value
@@ -418,7 +472,8 @@ class MonthlyDownloadUI:
                 'end_date': date(year + (month == 12), 1 if month == 12 else month + 1, 1).isoformat()}
 
     def _download(self, _=None):
-        controls = (self.region, self.year, self.month, self.source, self.test_mode, self.download_button)
+        controls = (self.region, self.year, self.month, self.source, self.test_mode,
+                    self.scene_limit, self.download_button)
         parameters = self.parameters()
         source, test_mode = self.source.value, self.test_mode.value
         self.result = self.download_parameters = self.download_source = self.download_region_path = None
@@ -428,7 +483,16 @@ class MonthlyDownloadUI:
         self.status.value = 'Consultando blocklist y descargando escenas…'
         try:
             with self.output:
-                result = download_month(self.workflow, parameters, source=source, test_mode=test_mode)
+                drive_dir = None
+                if test_mode:
+                    if self.scene_limit.value < 1:
+                        raise ValueError('El número de escenas debug debe ser mayor que cero.')
+                    if getattr(self.workflow, 'archive_dir', None) is None:
+                        self.workflow.use_drive('/content/drive/MyDrive/FuegoMonitor')
+                    drive_dir = (Path(self.workflow.archive_dir)/'debug_scenes'/source/
+                                 f"region_{parameters['region_id']}"/parameters['start_date'][:7])
+                result = download_month(self.workflow, parameters, source=source, test_mode=test_mode,
+                                        max_scenes=self.scene_limit.value, debug_drive_dir=drive_dir)
             self.result = result
             self.download_parameters = parameters
             self.download_source = source
@@ -442,6 +506,7 @@ class MonthlyDownloadUI:
         finally:
             for control in controls:
                 control.disabled = False
+            self._debug_changed()
 
     def show(self):
         from IPython.display import display

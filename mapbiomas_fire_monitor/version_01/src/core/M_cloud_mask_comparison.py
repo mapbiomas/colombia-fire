@@ -200,37 +200,81 @@ def _preview_scene(record, max_pixels=512):
 
 
 def plot_comparison(records, output_path):
-    """Always 3 rows × 10 columns; fewer scenes leave explicitly empty columns."""
+    """One scene per row; columns show original, SCL and CloudSEN12."""
     import matplotlib.pyplot as plt
-    figure, axes = plt.subplots(3, 10, figsize=(30, 9), squeeze=False, layout='constrained')
-    labels = ('Original', 'SCL aplicada', 'CloudSEN12 L2A aplicada')
-    for column in range(10):
-        for row in range(3):
-            axes[row, column].set_xticks([])
-            axes[row, column].set_yticks([])
-            axes[row, column].set_facecolor('#202020')
-            if column == 0:
-                axes[row, column].set_ylabel(labels[row], fontsize=9)
-        if column >= len(records):
-            axes[0, column].set_title('Sin escena')
-            continue
-        rgb, scl, model = _preview_scene(records[column])
-        axes[0, column].imshow(rgb)
-        axes[1, column].imshow(np.where((scl == 0)[..., None], rgb, np.nan))
-        axes[2, column].imshow(np.where((model == 0)[..., None], rgb, np.nan))
-        title = textwrap.fill(f'{column+1}. {records[column]["scene_id"]}', width=25)
-        axes[0, column].set_title(title, fontsize=6)
-    figure.suptitle('SWIR1/NIR/rojo · píxeles excluidos en negro · primeras 10 escenas', fontsize=13)
+    if not records:
+        raise ValueError('No hay escenas procesadas para comparar.')
+    figure, axes = plt.subplots(len(records), 3, figsize=(15, 4.5 * len(records)),
+                                squeeze=False, layout='constrained')
+    labels = ('Original · SWIR1 / NIR / rojo', 'Máscara SCL aplicada',
+              'Máscara CloudSEN12 L2A aplicada')
+    for row, record in enumerate(records):
+        rgb, scl, model = _preview_scene(record)
+        images = (rgb, np.where((scl == 0)[..., None], rgb, np.nan),
+                  np.where((model == 0)[..., None], rgb, np.nan))
+        for column, image in enumerate(images):
+            axis = axes[row, column]
+            axis.imshow(image)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            axis.set_facecolor('#202020')
+            if row == 0:
+                axis.set_title(labels[column], fontsize=12, pad=12)
+        scene_label = textwrap.fill(f'{row + 1}. {record["scene_id"]}', width=34)
+        axes[row, 0].set_ylabel(scene_label, rotation=0, ha='right', va='center',
+                                fontsize=8, labelpad=12)
+    figure.suptitle('Comparación por escena · píxeles excluidos en negro', fontsize=14)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=150)
     plt.show()
+    plt.close(figure)
     return figure
+
+
+def save_individual_comparison(record, output_path):
+    import matplotlib.pyplot as plt
+    rgb, scl, model = _preview_scene(record)
+    figure, axes = plt.subplots(1, 3, figsize=(12, 4), layout='constrained')
+    for axis, image, title in zip(axes, (
+            rgb, np.where((scl == 0)[..., None], rgb, np.nan),
+            np.where((model == 0)[..., None], rgb, np.nan)),
+            ('Original', 'SCL aplicada', 'CloudSEN12 L2A aplicada')):
+        axis.imshow(image)
+        axis.set_title(title)
+        axis.set_xticks([])
+        axis.set_yticks([])
+        axis.set_facecolor('#202020')
+    figure.suptitle(record['scene_id'], fontsize=9)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+    return str(output_path)
+
+
+def archive_debug_comparisons(records, output, monthly_download, drive_dir):
+    from M_scene_inspector import archive_download_result, copy_debug_file
+    drive_dir = Path(drive_dir)
+    raw_paths = monthly_download.get('drive_paths') or archive_download_result(monthly_download['result'], drive_dir)
+    archived = []
+    for record in records:
+        folder = drive_dir/'cloud_masks'/record['scene_id']
+        saved = dict(record)
+        for key in ('scl_path', 'model_path', 'individual_comparison_path'):
+            saved[key] = str(copy_debug_file(record[key], folder/Path(record[key]).name))
+        saved['spectral_paths'] = {key: path for key, path in raw_paths[record['scene_id']].items() if key != 'scl'}
+        (folder/'cloud_masks.json').write_text(json.dumps(saved, indent=2))
+        archived.append(saved)
+    for path in output['figure_paths']:
+        copy_debug_file(path, drive_dir/Path(path).name)
+    (drive_dir/'debug_processing.json').write_text(json.dumps({'scenes': archived}, indent=2))
+    return archived
 
 
 def process_downloaded_scenes(monthly_download, output_dir, *, region_path=None, debug=False,
                                weights_dir=None, model=None, block_size=512, halo=64, overwrite=False,
-                               use_gpu=True, live_monitor=False):
+                               use_gpu=True, live_monitor=False, debug_drive_dir=None):
     result = monthly_download.get('result')
     if result is None or not result.paths:
         raise ValueError('No hay escenas descargadas; ejecute primero la celda de descarga mensual.')
@@ -245,7 +289,8 @@ def process_downloaded_scenes(monthly_download, output_dir, *, region_path=None,
     from M_resource_monitor import ResourceMonitor
     output_dir = Path(output_dir)
     records = []
-    output = {'scenes': records, 'figure_path': None}
+    output = {'scenes': records, 'figure_path': None, 'figure_paths': [], 'drive_dir': None}
+    debug_drive_dir = debug_drive_dir or monthly_download.get('debug_drive_dir')
     with ResourceMonitor(output_dir, live=live_monitor) as monitor:
         if model is None:
             import torch
@@ -277,11 +322,25 @@ def process_downloaded_scenes(monthly_download, output_dir, *, region_path=None,
             monitor.notes.append(note)
             print(note)
         if debug:
-            output['figure_path'] = str(output_dir / 'cloud_mask_comparison_3x10.png')
             with monitor.phase('Visualización debug'):
-                plot_comparison(records, output['figure_path'])
+                for record in records:
+                    record['individual_comparison_path'] = save_individual_comparison(
+                        record, output_dir/record['scene_id']/'comparison.png')
+                path = str(output_dir/'cloud_mask_comparison_escenas_x3.png')
+                plot_comparison(records, path)
+                output['figure_paths'].append(path)
+                output['figure_path'] = path
+            if debug_drive_dir:
+                with monitor.phase('Archivo debug en Drive'):
+                    output['drive_scenes'] = archive_debug_comparisons(records, output, monthly_download, debug_drive_dir)
+                    output['drive_dir'] = str(debug_drive_dir)
     output.update(resources=monitor.summary(), resources_path=str(output_dir / 'resource_usage.json'),
                   comparison_path=str(output_dir / 'resource_comparison.csv'),
                   processed_scenes=len(records)-reused, cached_scenes=reused)
+    if output['drive_dir']:
+        from M_scene_inspector import copy_debug_file
+        for name in ('resource_usage.json', 'resource_usage.csv', 'resource_comparison.csv'):
+            copy_debug_file(output_dir/name, Path(output['drive_dir'])/name)
+        print(f'Escenas, máscaras y comparaciones debug guardadas en Drive: {output["drive_dir"]}')
     print(f'Máscaras guardadas para {len(records)} escenas en {output_dir}.')
     return output
