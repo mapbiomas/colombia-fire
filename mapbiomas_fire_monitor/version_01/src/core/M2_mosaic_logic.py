@@ -6,6 +6,7 @@ import os
 import subprocess
 import glob
 import time
+import re
 
 from M0_auth_config import (
     CONFIG, mosaic_name, _get_fs,
@@ -59,7 +60,7 @@ def run_cmd(args, label="Comando"):
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Error in {label}: {e.stderr.strip() if e.stderr else e.stdout.strip()}")
 
-def assemble_country_mosaic(year, month=None, period='monthly', bands=None, sensor=None, mosaic_method='minnbr', logger=None, progress_idx=0, progress_total=0, start_time=None):
+def assemble_country_mosaic(year, month=None, period='monthly', bands=None, sensor=None, mosaic_method='minnbr', logger=None, progress_idx=0, progress_total=0, start_time=None, strict_names=False):
     import shutil
     from M0_auth_config import GLOBAL_OPTS, _single
 
@@ -104,6 +105,12 @@ def assemble_country_mosaic(year, month=None, period='monthly', bands=None, sens
             fname = os.path.basename(f)
             # Match mais flexível: busca a banda cercada por separadores
             for b_name in (bands or CONFIG['bands_all']):
+                if strict_names:
+                    expected = mosaic_name(year, month, period, band=b_name, sensor=s, mosaic=m_method)
+                    if _matches_chunk_name(fname, expected):
+                        found_bands.setdefault(b_name, []).append(f)
+                        break
+                    continue
                 # Procuramos a banda como um "token" isolado no nome do arquivo
                 # Ex: _blue_ ou _blue.tif ou _blue-
                 if f"_{b_name}_" in fname or f"_{b_name}." in fname:
@@ -213,4 +220,86 @@ def assemble_from_export(exporter, logger=None):
     paths = assemble_country_mosaic(**selection, logger=logger)
     if len(paths) != len(selection['bands']):
         raise RuntimeError(f'M2 produjo {len(paths)}/{len(selection["bands"])} COGs. Revise el registro.')
+    return paths
+
+
+M2_BANDS = ('blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'dayOfYear')
+
+
+def _matches_chunk_name(filename, name):
+    # M1's prefix ends in '_'; GEE may append numeric row/column shard coordinates.
+    return re.fullmatch(re.escape(name) + r'(?:[_-]+(?:\d+(?:[-_]\d+)*)?)?\.tif', filename) is not None
+
+
+def scan_gcs_mosaics(years=None):
+    """Discover canonical monthly S2 exports directly in GCS, independent of M1 memory."""
+    import ee
+    root = f"{CONFIG['bucket']}/{CONFIG['gcs_library_images'].strip('/')}"
+    try:
+        files = _get_fs().find(root + '/SENTINEL2/MONTHLY')
+    except FileNotFoundError:
+        files = []
+    tasks = ee.data.getTaskList()
+    selected_years = set(years) if years is not None else None
+    methods = set(CONFIG['mosaic_methods'])
+    groups = {}
+    for file in files:
+        path = file.removeprefix('gs://')
+        if not path.startswith(root + '/'):
+            continue
+        parts = path[len(root) + 1:].split('/')
+        if len(parts) != 6:
+            continue
+        sensor, period, method, stamp, kind, filename = parts
+        if sensor != 'SENTINEL2' or period != 'MONTHLY' or method.lower() not in methods:
+            continue
+        if not re.fullmatch(r'\d{4}_(0[1-9]|1[0-2])', stamp) or kind not in ('CHUNKS', 'COG'):
+            continue
+        year, month = map(int, stamp.split('_'))
+        if selected_years is not None and year not in selected_years:
+            continue
+        for band in M2_BANDS:
+            name = mosaic_name(year, month, 'monthly', band=band, sensor='sentinel2', mosaic=method.lower())
+            valid = filename == name + '_cog.tif' if kind == 'COG' else _matches_chunk_name(filename, name)
+            if not valid:
+                continue
+            key = f'{stamp}/{method.lower()}'
+            row = groups.setdefault(key, dict(key=key, year=year, month=month, method=method.lower(),
+                                              chunks=set(), cogs=set(), blocked={}))
+            row['chunks' if kind == 'CHUNKS' else 'cogs'].add(band)
+            break
+    for row in groups.values():
+        for band in row['chunks'] - row['cogs']:
+            name = mosaic_name(row['year'], row['month'], 'monthly', band=band,
+                               sensor='sentinel2', mosaic=row['method'])
+            # Flags can differ across sessions; match the stable GCS export suffix.
+            matching = [t for t in tasks if str(t.get('description', '')).endswith('_GCS_' + name)]
+            if matching:
+                latest = max(matching, key=lambda task: task.get('creation_timestamp_ms', 0))
+                state = latest.get('state', 'UNKNOWN')
+                if any(t.get('state') in ('READY', 'RUNNING', 'PENDING', 'CANCEL_REQUESTED') for t in matching):
+                    row['blocked'][band] = 'EN CURSO'
+                elif state != 'COMPLETED':
+                    row['blocked'][band] = state
+        row['missing'] = set(M2_BANDS) - row['chunks'] - row['cogs']
+        row['pending'] = row['chunks'] - row['cogs']
+        row['ready'] = bool(row['pending']) and not row['missing'] and not row['blocked']
+    return sorted(groups.values(), key=lambda row: (row['year'], row['month'], row['method']), reverse=True)
+
+
+def assemble_gcs_mosaic(key, logger=None):
+    """Rescan before processing and assemble only missing COG bands for one GCS group."""
+    row = next((row for row in scan_gcs_mosaics() if row['key'] == key), None)
+    if row is None:
+        raise ValueError('El mosaico ya no aparece en GCS. Actualice la lista.')
+    if not row['pending'] and not row['missing']:
+        return []
+    if not row['ready']:
+        raise ValueError('El mosaico tiene bandas ausentes o exportaciones incompletas; actualice al finalizar M1.')
+    bands = [band for band in M2_BANDS if band in row['pending']]
+    paths = assemble_country_mosaic(row['year'], row['month'], period='monthly', bands=bands,
+                                    sensor='sentinel2', mosaic_method=row['method'], logger=logger,
+                                    strict_names=True)
+    if len(paths) != len(bands):
+        raise RuntimeError(f'M2 produjo {len(paths)}/{len(bands)} COGs pendientes. Revise el registro.')
     return paths

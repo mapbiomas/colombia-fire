@@ -511,3 +511,95 @@ class ExportMosaicAssemblerUI:
 def run_from_export(exporter):
     """M2 entry point for the monthly test notebook, without changing the original UI."""
     return ExportMosaicAssemblerUI(exporter).show()
+
+
+class GCSMosaicAssemblerUI:
+    """Independent M2 discovery/selection panel; GCS is the source of truth."""
+
+    def __init__(self, years=None):
+        self.years = years
+        self.results = []
+        self.selection = widgets.SelectMultiple(options=[], description='Mosaicos:', rows=7,
+                                                layout=widgets.Layout(width='100%'))
+        self.table = widgets.HTML()
+        self.output = widgets.Output()
+        self.refresh_button = widgets.Button(description='Consultar GCS', icon='refresh')
+        self.assemble_button = widgets.Button(description='Procesar seleccionados', icon='cogs',
+                                              button_style='success', disabled=True)
+        self.panel = widgets.VBox([
+            widgets.HTML('<h3 style="color:#185c44;margin:0">M2 · Mosaicos pendientes en GCS</h3>'
+                         '<p>Seleccione uno o varios meses disponibles. Se procesan únicamente las bandas sin COG.</p>'),
+            self.refresh_button, self.table, self.selection, self.assemble_button, self.output,
+        ], layout=widgets.Layout(border='1px solid #cbded5', padding='18px', width='100%'))
+        self.refresh_button.on_click(self._refresh)
+        self.assemble_button.on_click(self._assemble)
+        self.selection.observe(lambda _: setattr(self.assemble_button, 'disabled', not bool(self.selection.value)),
+                               names='value')
+        self._refresh()
+
+    def _refresh(self, _=None):
+        from html import escape
+        from M2_mosaic_logic import scan_gcs_mosaics
+        self.refresh_button.disabled = True
+        self.assemble_button.disabled = True
+        self.selection.options = []
+        self.table.value = '<p>Consultando GCS y tareas de exportación…</p>'
+        try:
+            rows = scan_gcs_mosaics(years=self.years)
+            options, entries = [], []
+            for row in rows:
+                stamp = f'{row["year"]}-{row["month"]:02d}'
+                if row['blocked']:
+                    status = '; '.join(f'{band}: {state}' for band, state in sorted(row['blocked'].items()))
+                elif row['missing']:
+                    status = 'Faltan bandas: ' + ', '.join(sorted(row['missing']))
+                elif not row['pending']:
+                    status = 'Completo'
+                else:
+                    status = 'Listo para procesar'
+                values = [stamp, row['method'].upper(), f'{len(row["chunks"])}/7', f'{len(row["cogs"])}/7', status]
+                entries.append('<tr>' + ''.join(f'<td style="padding:6px">{escape(v)}</td>' for v in values) + '</tr>')
+                if row['ready']:
+                    options.append((f'{stamp} · {row["method"].upper()} · {len(row["pending"])} COGs pendientes', row['key']))
+            self.table.value = (
+                '<div style="overflow:auto"><table><tr><th>Mes</th><th>Método</th>'
+                '<th>Bandas CHUNKS</th><th>COGs</th><th>Estado</th></tr>' + ''.join(entries) + '</table></div>'
+                if rows else '<p>No se encontraron mosaicos con la convención configurada en GCS.</p>')
+            self.selection.options = options
+            self.selection.value = ()
+        except Exception as exc:
+            self.table.value = f'<p>No se pudo consultar GCS: {escape(str(exc))}</p>'
+        finally:
+            self.refresh_button.disabled = False
+
+    def _assemble(self, _=None):
+        from M2_mosaic_logic import assemble_gcs_mosaic
+        keys = tuple(self.selection.value)
+        if not keys:
+            return
+        self.refresh_button.disabled = self.assemble_button.disabled = self.selection.disabled = True
+        self.output.clear_output()
+        self.results = []
+        try:
+            with self.output:
+                for key in keys:
+                    try:
+                        print(f'Procesando {key}…')
+                        paths = assemble_gcs_mosaic(key, logger=lambda message, level='info': print(message))
+                        self.results.extend(paths)
+                        for path in paths:
+                            print(path)
+                    except Exception as exc:
+                        print(f'Error en {key}: {exc}')
+                print(f'COGs generados: {len(self.results)}.')
+        finally:
+            self.selection.disabled = False
+            self._refresh()
+
+    def show(self):
+        display(self.panel)
+        return self
+
+
+def run_from_gcs(years=None):
+    return GCSMosaicAssemblerUI(years=years).show()

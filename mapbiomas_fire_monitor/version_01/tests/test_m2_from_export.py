@@ -108,6 +108,82 @@ class M2IntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'gsutil'):
                 self.logic.assemble_country_mosaic(2025, 1, sensor='sentinel2')
 
+    def scan_files(self, cogs=(), missing=(), extra=(), tasks=()):
+        self.config.CONFIG.update(gcs_library_images='sudamerica/colombia/CATALOG_01/LIBRARY_IMAGES',
+                                  mosaic_methods=['minnbr', 'minnbr_buffer'])
+        folder = 'gs://test/sudamerica/colombia/CATALOG_01/LIBRARY_IMAGES/SENTINEL2/MONTHLY/MINNBR/2025_01/'
+        files = []
+        for band in BANDS:
+            name = self.config.mosaic_name(2025, 1, band=band, sensor='sentinel2', mosaic='minnbr')
+            if band not in missing:
+                files.append(folder + 'CHUNKS/' + name + '_0000000000-0000000000.tif')
+            if band in cogs:
+                files.append(folder + 'COG/' + name + '_cog.tif')
+        files.extend(extra)
+        self.config._get_fs.return_value.find.return_value = files
+        ee = MagicMock()
+        ee.data.getTaskList.return_value = list(tasks)
+        with patch.dict(sys.modules, {'ee': ee}):
+            return self.logic.scan_gcs_mosaics()
+
+    def test_fresh_session_discovers_pending_bands_without_exporter(self):
+        rows = self.scan_files(cogs=['red'])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['key'], '2025_01/minnbr')
+        self.assertTrue(rows[0]['ready'])
+        self.assertEqual(rows[0]['pending'], set(BANDS) - {'red'})
+
+    def test_incomplete_and_fully_processed_groups_are_not_selectable(self):
+        self.assertFalse(self.scan_files(missing=['swir2'])[0]['ready'])
+        complete = self.scan_files(cogs=BANDS)[0]
+        self.assertFalse(complete['ready'])
+        self.assertEqual(complete['pending'], set())
+
+    def test_running_and_failed_remote_exports_block_assembly(self):
+        name = self.config.mosaic_name(2025, 1, band='red', sensor='sentinel2', mosaic='minnbr')
+        for state in ('RUNNING', 'FAILED', 'CANCELLED'):
+            row = self.scan_files(tasks=[{'description': 'OTHER_FLAG_GCS_' + name, 'state': state}])[0]
+            self.assertFalse(row['ready'])
+            self.assertIn('red', row['blocked'])
+
+    def test_strict_discovery_ignores_wrong_dates_country_and_shard_suffix(self):
+        folder = 'test/sudamerica/colombia/CATALOG_01/LIBRARY_IMAGES/SENTINEL2/MONTHLY/MINNBR/2025_01/CHUNKS/'
+        wrong = [folder + name for name in (
+            'image_colombia_fire_sentinel2_minnbr_red_2025_02_000.tif',
+            'image_peru_fire_sentinel2_minnbr_red_2025_01_000.tif',
+            'image_colombia_fire_sentinel2_minnbr_red_2025_01_backup.tif')]
+        row = self.scan_files(missing=['red'], extra=wrong)[0]
+        self.assertIn('red', row['missing'])
+        self.assertFalse(row['ready'])
+
+    def test_assembly_rechecks_gcs_and_processes_only_missing_cogs(self):
+        row = self.scan_files(cogs=set(BANDS) - {'red'})[0]
+        with patch.object(self.logic, 'scan_gcs_mosaics', return_value=[row]), \
+             patch.object(self.logic, 'assemble_country_mosaic', return_value=['gs://test/red_cog.tif']) as assemble:
+            self.assertEqual(self.logic.assemble_gcs_mosaic(row['key']), ['gs://test/red_cog.tif'])
+            self.assertEqual(assemble.call_args.kwargs['bands'], ['red'])
+            self.assertTrue(assemble.call_args.kwargs['strict_names'])
+        row['ready'] = False
+        with patch.object(self.logic, 'scan_gcs_mosaics', return_value=[row]):
+            with self.assertRaises(ValueError):
+                self.logic.assemble_gcs_mosaic(row['key'])
+
+    def test_chunk_filename_supports_single_file_and_gdal_shards(self):
+        for suffix in ('_.tif', '.tif', '_0000000000-0000000000.tif', '_-0000000000-0000000000.tif'):
+            self.assertTrue(self.logic._matches_chunk_name('base' + suffix, 'base'))
+        self.assertFalse(self.logic._matches_chunk_name('base_backup.tif', 'base'))
+
+    def test_strict_engine_excludes_other_month_files_in_the_same_folder(self):
+        bad_file = self.files[0].replace('_2025_01_', '_2025_02_')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.config.get_temp_dir.return_value = tmp
+            with patch.object(self.logic, 'check_m2_dependencies', return_value=[]), \
+                 patch.object(self.logic, 'list_gcs_files', return_value=self.files + [bad_file]), \
+                 patch.object(self.logic, 'run_cmd'):
+                paths = self.logic.assemble_country_mosaic(2025, 1, sensor='sentinel2', strict_names=True)
+            self.assertEqual(len(paths), 7)
+            self.assertEqual(self.gcs.download.call_count, 7)
+
 
 if __name__ == '__main__':
     unittest.main()
