@@ -261,3 +261,94 @@ class SceneInspectorUI:
 
 def run_ui(workflow, parameters):
     return SceneInspectorUI(workflow, parameters).show()
+
+
+def filter_blocklisted_scenes(scenes, blocked_ids):
+    """Exclude GEE IDs and reprocessed versions of the same acquisition/tile."""
+    import re
+    pattern = re.compile(r'^(\d{8}T\d{6})_\d{8}T\d{6}_T([A-Z0-9]{5})$')
+    blocked = {str(value).split('/')[-1] for value in blocked_ids}
+    acquisitions = {}
+    for value in blocked:
+        match = pattern.fullmatch(value)
+        if match:
+            acquisitions[(match[1], match[2])] = value
+    allowed, excluded = [], []
+    for scene in scenes:
+        index = scene['id'].split('/')[-1]
+        match = pattern.fullmatch(index)
+        reason = index if index in blocked else acquisitions.get((match[1], match[2])) if match else None
+        if reason:
+            excluded.append({'id': scene['id'], 'blocklist_id': reason})
+        else:
+            allowed.append(scene)
+    return allowed, excluded
+
+
+def download_month(workflow, parameters, *, source='planetary-computer', test_mode=False):
+    """Download a region/month after blocklist checks; test mode caps allowed scenes at ten."""
+    import M_blocklist as blocklists
+    from Sentinel2_pipeline_test import PipelineConfig, select_region, search_scenes, download_scenes
+
+    print('Consultando blocklist Sentinel-2…')
+    blocked_ids = blocklists.refresh_blocklists(['sentinel2'])['sentinel2']
+    report = blocklists.blocklist_report(['sentinel2'])['sentinel2']
+    sources = report.get('sources', [])
+    for entry in sources:
+        print(f"Blocklist {entry['asset']}: {entry['status']} ({entry.get('count', 0)} IDs)")
+    if not sources or any(entry.get('status') != 'ok' for entry in sources):
+        raise RuntimeError('No se pudo verificar toda la blocklist. No se iniciará la descarga. '
+                           'Revise el acceso a las fuentes GEE de la lista.')
+
+    # Query scene metadata only: no geemap layers, map tiles, or pixel masks.
+    session = SceneInspectionSession(workflow, parameters)
+    scenes = session.inspect()
+    allowed, excluded = filter_blocklisted_scenes(scenes, blocked_ids)
+    print(f'Escenas disponibles: {len(scenes)}. Excluidas por blocklist: {len(excluded)}.')
+    for row in excluded:
+        print(f"BLOCKLIST — {row['id']} (entrada: {row['blocklist_id']})")
+    summary = {'source': source, 'test_mode': bool(test_mode), 'excluded': excluded,
+               'unavailable': [], 'selected': [], 'result': None}
+    if not allowed:
+        print('No hay escenas permitidas para descargar.')
+        return summary
+
+    workflow.load_gee_vectors(parameters)
+    config = PipelineConfig(
+        shapefile=workflow.tiles_path, regions_zip=workflow.regions_path,
+        region_id=parameters['region_id'], start_date=parameters['start_date'],
+        end_date=(date.fromisoformat(parameters['end_date']) - timedelta(days=1)).isoformat(),
+        bands=('red', 'nir', 'swir16', 'swir22'), download_images=True,
+        data_dir=workflow.results_dir / 'monthly_scenes' / source / f"{parameters['start_date']}_{parameters['end_date']}",
+        source=source)
+    region = select_region(config)
+    available = search_scenes(config, region.region, filter_cloud_cover=False)
+    chosen, seen = [], set()
+    # Stable chronological order makes the ten-scene test repeatable.
+    for scene in sorted(allowed, key=lambda row: (row['time'], row['id'])):
+        try:
+            item, = match_selected_scenes([scene], available.items)
+        except ValueError:
+            summary['unavailable'].append(scene['id'])
+            print(f"No disponible en {source}: {scene['id']}")
+            continue
+        if item.id in seen:
+            continue
+        seen.add(item.id)
+        chosen.append(item)
+        summary['selected'].append({'gee_id': scene['id'], 'stac_id': item.id})
+        if test_mode and len(chosen) == 10:
+            break
+    print(f"Modo de prueba: {'ACTIVADO (máximo 10 escenas)' if test_mode else 'DESACTIVADO (todas las permitidas)'}. "
+          f'Escenas a descargar: {len(chosen)}.')
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {key: value for key, value in summary.items() if key != 'result'}
+    manifest.update(region_id=parameters['region_id'], start_date=parameters['start_date'],
+                    end_date=parameters['end_date'], bands=list(config.bands))
+    (config.output_dir / 'monthly_download_selection.json').write_text(json.dumps(manifest, indent=2))
+    if chosen:
+        summary['result'] = download_scenes(config, chosen)
+        print(f'Descarga terminada. Directorio: {config.output_dir}')
+    else:
+        print('Ninguna escena permitida está disponible en la fuente elegida.')
+    return summary

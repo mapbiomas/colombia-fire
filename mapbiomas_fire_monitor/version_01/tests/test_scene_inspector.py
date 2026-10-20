@@ -1,6 +1,8 @@
 """Offline checks for unmasked inspection and explicit GEE-to-STAC selection."""
 from datetime import datetime, timezone
 import ast
+import contextlib
+import io
 from datetime import date
 import importlib.util
 from pathlib import Path
@@ -12,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 CORE = Path(__file__).resolve().parents[1] / 'src/core'
 sys.path.insert(0, str(CORE))
-from M_scene_inspector import SceneInspectionSession, SceneInspectorUI, match_selected_scenes
+from M_scene_inspector import SceneInspectionSession, SceneInspectorUI, match_selected_scenes, filter_blocklisted_scenes, download_month
 
 
 class SceneInspectorTests(unittest.TestCase):
@@ -184,6 +186,82 @@ class SceneInspectorTests(unittest.TestCase):
         self.assertEqual(ui.map.addLayer.call_count, 2)
         self.assertEqual(ui.layer_status['scene2'].value, 'Lista (apagada)')
         self.assertEqual(len(ui.selected_ids), 2)
+
+    def monthly_fixture(self, root, count=15):
+        scenes, items = [], []
+        for i in range(count):
+            instant = datetime.fromtimestamp(self.time / 1000 + i, timezone.utc)
+            stamp = instant.strftime('%Y%m%dT%H%M%S')
+            scenes.append(dict(self.row, id=f'COPERNICUS/S2_SR_HARMONIZED/{stamp}_20260112T170000_T18NZL',
+                               time=self.time + i * 1000, product_id=f'PRODUCT_{i}'))
+            items.append(self.item(f'item{i}', product=f'PRODUCT_{i}', date=instant.isoformat()))
+        config = types.SimpleNamespace(output_dir=Path(root), bands=['red', 'nir', 'swir16', 'swir22'])
+        self.pipeline.PipelineConfig.return_value = config
+        self.pipeline.search_scenes.return_value.items = items
+        blocklists = types.ModuleType('M_blocklist')
+        blocked = [scene['id'].split('/')[-1] for scene in scenes[:2]]
+        blocklists.refresh_blocklists = MagicMock(return_value={'sentinel2': blocked})
+        blocklists.blocklist_report = MagicMock(return_value={'sentinel2': {
+            'sources': [{'asset': 'test-source', 'status': 'ok', 'count': len(blocked)}]}})
+        return scenes, items, blocklists
+
+    def test_monthly_test_mode_excludes_blocklist_before_ten_scene_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenes, items, blocklists = self.monthly_fixture(root)
+            output = io.StringIO()
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}), \
+                 patch.object(SceneInspectionSession, 'inspect', return_value=scenes), \
+                 contextlib.redirect_stdout(output):
+                report = download_month(self.workflow, self.params, test_mode=True)
+            selected = self.pipeline.download_scenes.call_args.args[1]
+            self.assertEqual(selected, items[2:12])
+            self.assertEqual(len(report['selected']), 10)
+            self.assertEqual(len(report['excluded']), 2)
+            self.assertIn(scenes[0]['id'], output.getvalue())
+            self.assertFalse(self.pipeline.search_scenes.call_args.kwargs['filter_cloud_cover'])
+            self.assertTrue((Path(root) / 'monthly_download_selection.json').is_file())
+
+    def test_monthly_normal_mode_downloads_all_permitted_scenes(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenes, items, blocklists = self.monthly_fixture(root)
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}), \
+                 patch.object(SceneInspectionSession, 'inspect', return_value=scenes), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = download_month(self.workflow, self.params, test_mode=False)
+            self.assertEqual(self.pipeline.download_scenes.call_args.args[1], items[2:])
+            self.assertEqual(len(report['selected']), 13)
+
+    def test_monthly_cannot_read_blocklist_does_not_start_download(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenes, items, blocklists = self.monthly_fixture(root)
+            blocklists.blocklist_report.return_value['sentinel2']['sources'][0]['status'] = 'error'
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}), \
+                 patch.object(SceneInspectionSession, 'inspect') as inspect, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'blocklist'):
+                    download_month(self.workflow, self.params)
+                inspect.assert_not_called()
+            self.pipeline.download_scenes.assert_not_called()
+
+    def test_all_blocklisted_scenes_do_not_trigger_transfers(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenes, items, blocklists = self.monthly_fixture(root, count=2)
+            with patch.dict(sys.modules, {'M_blocklist': blocklists}), \
+                 patch.object(SceneInspectionSession, 'inspect', return_value=scenes), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = download_month(self.workflow, self.params, test_mode=True)
+            self.assertIsNone(report['result'])
+            self.pipeline.download_scenes.assert_not_called()
+            self.workflow.load_gee_vectors.assert_not_called()
+
+    def test_blocklist_matches_full_ids_and_reprocessed_acquisitions(self):
+        blocked = '20260112T153000_20260112T170000_T18NZL'
+        scenes = [dict(self.row, id='COPERNICUS/S2_SR_HARMONIZED/' + blocked),
+                  dict(self.row, id='20260112T153000_20260113T170000_T18NZL'),
+                  dict(self.row, id='20260113T153000_20260113T170000_T18NZL')]
+        allowed, excluded = filter_blocklisted_scenes(scenes, [blocked])
+        self.assertEqual(allowed, scenes[2:])
+        self.assertEqual(len(excluded), 2)
 
 
 if __name__ == '__main__':
