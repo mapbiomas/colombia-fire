@@ -1,4 +1,4 @@
-"""Monthly Sentinel-2 preview and exports using the shared M1 mosaic engine."""
+"""Monthly Sentinel-2 preview and exports using M1 composition and the shared workflow map renderer."""
 
 from datetime import date
 from html import escape
@@ -39,9 +39,6 @@ class MonthlyMosaicSession:
         geometry = config.get_country_geometry()
         image = get_quality_mosaic('sentinel2', year, start, end, geometry,
                                    month=month, method=method)
-        # Evaluate before enabling exports, including Cloud Score / buffer errors.
-        if not image.select('red').getMapId({'min': 0, 'max': 40}):
-            raise ValueError('No se pudo preparar la vista del mosaico.')
         self.prepared = dict(year=year, month=month, method=method, image=image,
                              geometry=geometry, signature=_config_signature())
         return self.prepared
@@ -87,10 +84,11 @@ class MonthlyMosaicSession:
 
 
 class MonthlyMosaicUI:
-    def __init__(self, years=None):
+    def __init__(self, years=None, tiles_asset=None):
         import ipywidgets as widgets
         import M0_auth_config as config
         self.session = MonthlyMosaicSession()
+        self.tiles_asset = tiles_asset
         selected_years = config.resolve_years(years, sensor='sentinel2')
         methods = config.CONFIG['mosaic_methods']
         self.year = widgets.Dropdown(options=selected_years, description='Año:')
@@ -149,20 +147,13 @@ class MonthlyMosaicUI:
 
     def _preview(self, _=None):
         from IPython.display import display
-        import geemap
         self._busy(True)
         self.messages.clear_output()
         self.map_output.clear_output()
         try:
             with self.messages:
                 print('Preparando el mosaico con la lógica M1…')
-            prepared = self.session.prepare(self.year.value, self.month.value, self.method.value)
-            canvas = geemap.Map()
-            canvas.addLayer(prepared['image'], {'bands': ['swir1', 'nir', 'red'], 'min': 0, 'max': 40},
-                            f"{self.method.value.upper()} {self.year.value}-{self.month.value:02d}")
-            canvas.addLayer(prepared['image'].select('dayOfYear'),
-                            {'min': 1, 'max': 366, 'palette': ['blue', 'yellow', 'red']}, 'Día del año', False)
-            canvas.centerObject(prepared['geometry'], 6)
+            canvas = self.preview()
             with self.map_output:
                 display(canvas)
             self.messages.clear_output()
@@ -174,6 +165,26 @@ class MonthlyMosaicUI:
                 print(f'No se pudo preparar el mosaico: {exc}')
         finally:
             self._busy(False)
+
+    def preview(self):
+        """Return the same map renderer used by workflow.preview, with the M1 image."""
+        import ee
+        import M0_auth_config as config
+        from Sentinel2_pipeline_test import create_geemap_preview
+        prepared = self.session.prepare(self.year.value, self.month.value, self.method.value)
+        regions = ee.FeatureCollection(config.CONFIG['asset_regions'])
+        tiles = ee.FeatureCollection(self.tiles_asset).filterBounds(prepared['geometry']) if self.tiles_asset else None
+        try:
+            canvas = create_geemap_preview({
+                'mosaic': prepared['image'], 'regions': regions, 'tiles': tiles,
+                'parameters': {'vis': {'bands': ['swir1', 'nir', 'red'], 'min': 0, 'max': 40}},
+            })
+        except Exception:
+            self.session.prepared = None
+            self.export_button.disabled = True
+            raise
+        self.export_button.disabled = False
+        return canvas
 
     def _export(self, _=None):
         self._busy(True)
@@ -216,8 +227,8 @@ class MonthlyMosaicUI:
         return self
 
 
-def run_ui(years=None):
-    return MonthlyMosaicUI(years=years).show()
+def run_ui(years=None, tiles_asset=None):
+    return MonthlyMosaicUI(years=years, tiles_asset=tiles_asset).show()
 
 
 def start_export(ui_obj):

@@ -14,7 +14,8 @@ from M1_mosaic_preview_ui import BANDS, MonthlyMosaicSession, MonthlyMosaicUI, m
 class MonthlyMosaicTests(unittest.TestCase):
     def setUp(self):
         self.config = types.ModuleType('M0_auth_config')
-        self.config.CONFIG = {'mosaic_methods': ['minnbr', 'minnbr_buffer'], 'country': 'colombia'}
+        self.config.CONFIG = {'mosaic_methods': ['minnbr', 'minnbr_buffer'], 'country': 'colombia',
+                              'gee_project': 'test', 'asset_regions': 'projects/test/assets/regions'}
         self.config.GLOBAL_OPTS = {'PERSONAL_TASK_FLAG': 'MONITOR'}
         self.config.get_country_geometry = MagicMock()
         self.config.mosaic_name = lambda y, m, p, band, mosaic, sensor: f'{mosaic}_{band}_{y}_{m:02d}'
@@ -22,10 +23,12 @@ class MonthlyMosaicTests(unittest.TestCase):
         self.image = MagicMock()
         self.image.bandNames.return_value.getInfo.return_value = [
             'blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'dayOfYear']
+        self.builder = types.ModuleType('Sentinel2_pipeline_test')
+        self.builder.create_geemap_preview = MagicMock()
         self.logic.get_quality_mosaic = MagicMock(return_value=self.image)
         self.logic.export_to_asset = MagicMock(side_effect=self.new_task)
         self.logic.export_to_gcs = MagicMock(side_effect=lambda *a, **kw: [self.new_task()])
-        self.modules = patch.dict(sys.modules, {'M0_auth_config': self.config, 'M1_export_logic': self.logic})
+        self.modules = patch.dict(sys.modules, {'M0_auth_config': self.config, 'M1_export_logic': self.logic, 'Sentinel2_pipeline_test': self.builder})
         self.modules.start()
         self.addCleanup(self.modules.stop)
         self.session = MonthlyMosaicSession()
@@ -50,6 +53,7 @@ class MonthlyMosaicTests(unittest.TestCase):
         self.logic.get_quality_mosaic.assert_called_once_with(
             'sentinel2', 2025, '2025-01-01', '2025-02-01',
             self.config.get_country_geometry.return_value, month=1, method='minnbr')
+        self.image.getMapId.assert_not_called()
         self.image.bandNames.assert_not_called()
         for fn in (self.logic.export_to_asset, self.logic.export_to_gcs):
             for call in fn.call_args_list:
@@ -132,6 +136,23 @@ class MonthlyMosaicTests(unittest.TestCase):
             opts = ee.batch.Export.image.toAsset.call_args.kwargs
             self.assertEqual(opts['pyramidingPolicy'], {'.default': 'mean'})
             self.assertFalse(opts['overwrite'])
+
+    def test_preview_reuses_workflow_renderer_with_the_original_m1_image(self):
+        ui = MonthlyMosaicUI.__new__(MonthlyMosaicUI)
+        ui.session = self.session
+        ui.year = types.SimpleNamespace(value=2025)
+        ui.month = types.SimpleNamespace(value=1)
+        ui.method = types.SimpleNamespace(value='minnbr')
+        ui.tiles_asset = 'projects/test/assets/tiles'
+        ui.export_button = MagicMock()
+        with patch.dict(sys.modules, {'ee': MagicMock()}):
+            canvas = ui.preview()
+        self.assertIs(canvas, self.builder.create_geemap_preview.return_value)
+        result = self.builder.create_geemap_preview.call_args.args[0]
+        self.assertIs(result['mosaic'], self.image)
+        self.assertEqual(result['parameters']['vis']['max'], 40)
+        self.image.getMapId.assert_not_called()
+        self.assertIs(self.session.prepared['image'], self.image)
 
 
 if __name__ == '__main__':

@@ -1823,8 +1823,9 @@ def create_geemap_preview(result: dict, *, basemap: str = "Esri.WorldImagery"):
     result.setdefault("_gee_tile_cache", {})[signature] = {
         "url": canvas.layers[-1].url, "created": time.monotonic(),
     }
-    canvas.addLayer(result["tiles"].style(color="ffff00", fillColor="00000000", width=1), {}, "Índice de teselas")
-    canvas.layers[-1].pane = "monitor-vectors"
+    if result.get("tiles") is not None:
+        canvas.addLayer(result["tiles"].style(color="ffff00", fillColor="00000000", width=1), {}, "Índice de teselas")
+        canvas.layers[-1].pane = "monitor-vectors"
     canvas.addLayer(result["regions"].style(color="ff0000", fillColor="00000000", width=2), {}, "Región seleccionada")
     canvas.layers[-1].pane = "monitor-vectors"
     canvas.centerObject(result["regions"], 8)
