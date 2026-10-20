@@ -61,7 +61,8 @@ class SceneInspectionSession:
                            .sort('system:index'))
         def describe(value):
             image = ee.Image(value)
-            return ee.Dictionary({'id': image.id(), 'time': image.get('system:time_start'),
+            asset_id = ee.String('COPERNICUS/S2_SR_HARMONIZED/').cat(ee.String(image.get('system:index')))
+            return ee.Dictionary({'id': asset_id, 'time': image.get('system:time_start'),
                                   'tile': image.get('MGRS_TILE'), 'cloud': image.get('CLOUDY_PIXEL_PERCENTAGE'),
                                   'product_id': image.get('PRODUCT_ID')})
         info = ee.Dictionary({'region_count': regions.size(), 'scenes': self.collection.toList(
@@ -114,92 +115,133 @@ class SceneInspectorUI:
         import ipywidgets as widgets
         self.session = SceneInspectionSession(workflow, parameters)
         self.map = None
-        self.scene_layer = None
-        self.view = widgets.Dropdown(options=[], description='Visualizar:', layout=widgets.Layout(width='100%'))
-        self.selection = widgets.SelectMultiple(options=[], description='Descargar:', rows=9,
-                                                layout=widgets.Layout(width='100%'))
+        self.download_checks = {}
+        self.layer_status = {}
         self.source = widgets.Dropdown(options=['planetary-computer', 'earth-search'], description='Fuente:')
         self.inspect_button = widgets.Button(description='Listar imágenes', icon='search', button_style='info')
-        self.download_button = widgets.Button(description='Descargar seleccionadas', icon='download',
+        self.download_button = widgets.Button(description='Descargar marcadas', icon='download',
                                                button_style='success', disabled=True)
+        self.select_all_button = widgets.Button(description='Marcar todas', icon='check-square-o', disabled=True)
+        self.select_none_button = widgets.Button(description='Desmarcar todas', icon='square-o', disabled=True)
         self.messages = widgets.Output()
-        self.map_output = widgets.Output()
+        self.map_container = widgets.VBox(layout=widgets.Layout(width='100%'))
+        self.table = widgets.VBox(layout=widgets.Layout(max_height='420px', overflow='auto', width='100%'))
+        self.selection_summary = widgets.HTML()
         self.panel = widgets.VBox([
             widgets.HTML('<h3 style="color:#185c44;margin:0">Imágenes L2A por región</h3>'
-                         '<p>Vista SWIR1 / NIR / rojo, sin máscara adicional ni filtro de nubosidad. '
-                         'Cambie la imagen visible y seleccione las escenas que desea descargar.</p>'),
-            self.inspect_button, self.view, self.map_output, self.selection, self.source,
-            self.download_button, self.messages,
+                         '<p>Todas las imágenes quedan marcadas para descargar. Desmarque las que no necesita. '
+                         'Las capas del mapa comienzan apagadas; use el control de capas para activarlas. '
+                         'Vista SWIR1 / NIR / rojo, sin máscara adicional ni filtro de nubosidad.</p>'),
+            self.inspect_button, self.map_container,
+            widgets.HBox([self.select_all_button, self.select_none_button]),
+            self.table, self.selection_summary, self.source, self.download_button, self.messages,
         ], layout=widgets.Layout(border='1px solid #cbded5', padding='18px', width='100%'))
         self.inspect_button.on_click(self._inspect)
-        self.view.observe(self._view, names='value')
-        self.selection.observe(lambda _: self._update_download(), names='value')
+        self.select_all_button.on_click(lambda _: self._select_all(True))
+        self.select_none_button.on_click(lambda _: self._select_all(False))
         self.download_button.on_click(self._download)
 
+    @property
+    def selected_ids(self):
+        return [scene_id for scene_id, check in self.download_checks.items() if check.value]
+
     def _update_download(self):
-        self.download_button.disabled = not bool(self.selection.value)
+        selected = len(self.selected_ids)
+        self.download_button.disabled = not bool(selected)
+        self.selection_summary.value = f'<p><b>{selected}/{len(self.download_checks)}</b> imágenes marcadas para descargar.</p>'
+
+    def _select_all(self, selected):
+        for check in self.download_checks.values():
+            check.value = selected
+        self._update_download()
+
+    def _build_table(self, scenes):
+        import ipywidgets as widgets
+        from html import escape
+        widths = ('100px', '185px', '85px', '90px', '350px', '100px')
+        def text_cell(text, width):
+            return widgets.HTML(escape(str(text)), layout=widgets.Layout(width=width, flex='0 0 auto'))
+        rows = [widgets.HBox([text_cell(label, width) for label, width in zip(
+            ('Descargar', 'Adquisición (UTC)', 'Tesela', 'Nubes (%)', 'Imagen GEE', 'Capa'), widths)])]
+        self.download_checks = {}
+        self.layer_status = {}
+        for scene in scenes:
+            check = widgets.Checkbox(value=True, indent=False,
+                                     layout=widgets.Layout(width=widths[0], flex='0 0 auto'))
+            check.observe(lambda _: self._update_download(), names='value')
+            self.download_checks[scene['id']] = check
+            timestamp = datetime.fromtimestamp(scene['time'] / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            status = text_cell('Preparando…', widths[-1])
+            self.layer_status[scene['id']] = status
+            values = (timestamp, scene['tile'], scene.get('cloud', '—'), scene['id'].split('/')[-1])
+            cells = [check] + [text_cell(value, width) for value, width in zip(values, widths[1:-1])] + [status]
+            rows.append(widgets.HBox(cells, layout=widgets.Layout(border_bottom='1px solid #ddd')))
+        self.table.children = tuple(rows)
+        self.select_all_button.disabled = self.select_none_button.disabled = not bool(scenes)
+        self._update_download()
+
+    def _add_scene_layers(self, scenes):
+        failed = []
+        for scene in scenes:
+            try:
+                self.map.addLayer(self.session.scene_image(scene['id']),
+                                  {'bands': ['B11', 'B8', 'B4'], 'min': .03, 'max': .4},
+                                  scene['id'].split('/')[-1], shown=False)
+                self.layer_status[scene['id']].value = 'Lista (apagada)'
+            except Exception as exc:
+                self.layer_status[scene['id']].value = 'Error de vista'
+                failed.append((scene['id'], str(exc)))
+        return failed
 
     def _inspect(self, _=None):
         import geemap
-        from IPython.display import display
+        import ipywidgets as widgets
         self.inspect_button.disabled = True
         self.download_button.disabled = True
-        self.selection.options = []
-        self.view.options = []
+        self.download_checks = {}
+        self.layer_status = {}
+        self.select_all_button.disabled = self.select_none_button.disabled = True
+        self.table.children = ()
+        self.map_container.children = ()
+        self.selection_summary.value = ''
         self.messages.clear_output()
-        self.map_output.clear_output()
         self.map = None
-        self.scene_layer = None
         try:
             with self.messages:
                 scenes = self.session.inspect()
-                print(f'{len(scenes)} imágenes disponibles. Elija cuáles descargar; la vista no descarga archivos.')
+                print(f'{len(scenes)} imágenes disponibles. Preparando las capas…')
+            self._build_table(scenes)
             if not scenes:
                 return
-            self.map = geemap.Map(ee_initialize=False)
+            # Embed the ipyleaflet widget directly, avoiding nested output capture in Colab.
+            self.map = geemap.Map(ee_initialize=False, layout=widgets.Layout(height='600px', width='100%'))
+            self.map_container.children = (self.map,)
             self.map.add_basemap('Esri.WorldImagery')
             self.map.centerObject(self.session.geometry, 8)
-            options = []
-            for row in scenes:
-                time = datetime.fromtimestamp(row['time'] / 1000, timezone.utc).isoformat()
-                cloud = row.get('cloud')
-                label = f"{time} · {row['tile']} · nubes {cloud}% · {row['id'].split('/')[-1]}"
-                options.append((label, row['id']))
-            self.selection.options = options
-            self.selection.value = ()
-            self.view.options = options
-            with self.map_output:
-                display(self.map)
+            self.map.add_layer_control()
+            failed = self._add_scene_layers(scenes)
+            with self.messages:
+                print(f'{len(scenes) - len(failed)}/{len(scenes)} capas listas, apagadas por defecto. '
+                      'Actívelas desde el control de capas del mapa.')
+                for scene_id, error in failed:
+                    print(f'Error de vista en {scene_id}: {error}')
         except Exception as exc:
             with self.messages:
-                print(f'No se pudo listar las imágenes: {exc}')
+                print(f'No se pudo completar la inspección: {exc}')
         finally:
             self.inspect_button.disabled = False
             self._update_download()
 
-    def _view(self, change):
-        if self.map is None or not change['new']:
-            return
-        try:
-            if self.scene_layer is not None:
-                self.map.remove_layer(self.scene_layer)
-                self.scene_layer = None
-            self.map.addLayer(self.session.scene_image(change['new']),
-                              {'bands': ['B11', 'B8', 'B4'], 'min': .03, 'max': .4},
-                              change['new'].split('/')[-1])
-            self.scene_layer = self.map.layers[-1]
-        except Exception as exc:
-            with self.messages:
-                print(f'No se pudo visualizar la escena: {exc}')
-
     def _download(self, _=None):
-        controls = (self.inspect_button, self.download_button, self.view, self.selection, self.source)
+        selected = self.selected_ids
+        controls = (self.inspect_button, self.download_button, self.source,
+                    self.select_all_button, self.select_none_button, *self.download_checks.values())
         for control in controls:
             control.disabled = True
         self.messages.clear_output()
         try:
             with self.messages:
-                result = self.session.download(self.selection.value, self.source.value)
+                result = self.session.download(selected, self.source.value)
                 print(f'Escenas descargadas: {len(result.paths)}. Archivos: {len(result.manifest)}.')
                 for scene_id, paths in result.paths.items():
                     print(scene_id, '→', str(Path(next(iter(paths.values()))).parent))

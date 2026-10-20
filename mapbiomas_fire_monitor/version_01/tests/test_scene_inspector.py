@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 CORE = Path(__file__).resolve().parents[1] / 'src/core'
 sys.path.insert(0, str(CORE))
-from M_scene_inspector import SceneInspectionSession, match_selected_scenes
+from M_scene_inspector import SceneInspectionSession, SceneInspectorUI, match_selected_scenes
 
 
 class SceneInspectorTests(unittest.TestCase):
@@ -121,6 +121,69 @@ class SceneInspectorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'request captured'):
                 namespace['search_scenes'](config, tile, filter_cloud_cover=enabled)
             self.assertEqual(client.open.return_value.search.call_args.kwargs['query'], expected)
+
+    def make_ui(self):
+        class Widget:
+            def __init__(self, *args, **kwargs):
+                self.value = kwargs.get('value', args[0] if args and isinstance(args[0], str) else '')
+                self.children = tuple(args[0]) if args and isinstance(args[0], list) else ()
+                self.disabled = kwargs.get('disabled', False)
+            def observe(self, *args, **kwargs): pass
+            def on_click(self, *args, **kwargs): pass
+            def clear_output(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+        widgets = types.SimpleNamespace(**{name: Widget for name in (
+            'Dropdown', 'Button', 'Output', 'VBox', 'HBox', 'HTML', 'Checkbox', 'Layout')})
+        p = patch.dict(sys.modules, {'ipywidgets': widgets})
+        p.start()
+        self.addCleanup(p.stop)
+        return SceneInspectorUI(self.workflow, self.params)
+
+    def test_table_checks_every_scene_and_unchecking_excludes_download(self):
+        ui = self.make_ui()
+        rows = [self.row, dict(self.row, id='scene2')]
+        ui._build_table(rows)
+        self.assertEqual(ui.selected_ids, [self.row['id'], 'scene2'])
+        self.assertEqual(len(ui.table.children), 3)  # header plus two rows
+        ui.download_checks['scene2'].value = False
+        ui._update_download()
+        self.assertEqual(ui.selected_ids, [self.row['id']])
+        ui.session.download = MagicMock(return_value=types.SimpleNamespace(paths={}, manifest=[]))
+        ui._download()
+        ui.session.download.assert_called_once_with([self.row['id']], ui.source.value)
+        ui._select_all(False)
+        self.assertEqual(ui.selected_ids, [])
+        self.assertTrue(ui.download_button.disabled)
+
+    def test_all_scene_layers_are_added_off_and_map_is_embedded_directly(self):
+        ui = self.make_ui()
+        scenes = [self.row, dict(self.row, id='scene2')]
+        ui.session.inspect = MagicMock(return_value=scenes)
+        ui.session.scene_image = MagicMock()
+        ui.session.geometry = 'region'
+        geemap = MagicMock()
+        with patch.dict(sys.modules, {'geemap': geemap}):
+            ui._inspect()
+        canvas = geemap.Map.return_value
+        self.assertEqual(ui.map_container.children, (canvas,))
+        canvas.add_layer_control.assert_called_once()
+        self.assertEqual(canvas.addLayer.call_count, 2)
+        self.assertTrue(all(call.kwargs['shown'] is False for call in canvas.addLayer.call_args_list))
+        self.assertEqual(ui.selected_ids, [self.row['id'], 'scene2'])
+
+    def test_one_failed_map_layer_does_not_hide_the_other_scenes(self):
+        ui = self.make_ui()
+        scenes = [self.row, dict(self.row, id='scene2')]
+        ui._build_table(scenes)
+        ui.map = MagicMock()
+        ui.map.addLayer.side_effect = [RuntimeError('tile failure'), None]
+        ui.session.scene_image = MagicMock()
+        failed = ui._add_scene_layers(scenes)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(ui.map.addLayer.call_count, 2)
+        self.assertEqual(ui.layer_status['scene2'].value, 'Lista (apagada)')
+        self.assertEqual(len(ui.selected_ids), 2)
 
 
 if __name__ == '__main__':
