@@ -3,6 +3,10 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import json
 
+# The L2A CloudSEN12 model needs all 12 spectral bands; SCL is the comparison mask.
+DOWNLOAD_BANDS = ("coastal", "blue", "green", "red", "rededge1", "rededge2", "rededge3",
+                  "nir", "nir08", "nir09", "swir16", "swir22", "scl")
+
 
 def _tile(value):
     return str(value).upper().removeprefix('T')
@@ -95,7 +99,7 @@ class SceneInspectionSession:
             shapefile=self.workflow.tiles_path, regions_zip=self.workflow.regions_path,
             region_id=params['region_id'], start_date=params['start_date'],
             end_date=(date.fromisoformat(params['end_date']) - timedelta(days=1)).isoformat(),
-            bands=('red', 'nir', 'swir16', 'swir22'), download_images=True,
+            bands=DOWNLOAD_BANDS, download_images=True,
             data_dir=self.workflow.results_dir / 'selected_scenes' / source / f"{params['start_date']}_{params['end_date']}",
             source=source)
         region = select_region(config)
@@ -318,7 +322,7 @@ def download_month(workflow, parameters, *, source='planetary-computer', test_mo
         shapefile=workflow.tiles_path, regions_zip=workflow.regions_path,
         region_id=parameters['region_id'], start_date=parameters['start_date'],
         end_date=(date.fromisoformat(parameters['end_date']) - timedelta(days=1)).isoformat(),
-        bands=('red', 'nir', 'swir16', 'swir22'), download_images=True,
+        bands=DOWNLOAD_BANDS, download_images=True,
         data_dir=workflow.results_dir / 'monthly_scenes' / source / f"{parameters['start_date']}_{parameters['end_date']}",
         source=source)
     region = select_region(config)
@@ -352,3 +356,98 @@ def download_month(workflow, parameters, *, source='planetary-computer', test_mo
     else:
         print('Ninguna escena permitida está disponible en la fuente elegida.')
     return summary
+
+
+def region_menu_options(regions_asset):
+    """Fetch region IDs/names only, without downloading GEE geometries."""
+    import ee
+    regions = ee.FeatureCollection(regions_asset)
+    def describe(value):
+        feature = ee.Feature(value)
+        return ee.Dictionary({'id': feature.get('id_monitor'), 'name': feature.get('nombre'),
+                              'fallback': feature.get('LEVEL_3')})
+    rows = regions.toList(regions.size()).map(describe).getInfo()
+    if not rows or any(row.get('id') is None for row in rows):
+        raise ValueError('El asset de regiones debe tener un id_monitor por región.')
+    if len({str(row['id']) for row in rows}) != len(rows):
+        raise ValueError('El asset contiene id_monitor duplicados.')
+    rows.sort(key=lambda row: (0, int(row['id'])) if str(row['id']).isdigit() else (1, str(row['id'])))
+    return [(f"{row['id']} · {row.get('name') or row.get('fallback') or 'Región'}", row['id']) for row in rows]
+
+
+class MonthlyDownloadUI:
+    """One menu cell; only the explicit Download click starts scene transfers."""
+
+    def __init__(self, workflow, regions_asset, tiles_asset):
+        import ipywidgets as widgets
+        self.workflow = workflow
+        self.regions_asset, self.tiles_asset = regions_asset, tiles_asset
+        self.result = None
+        self.download_parameters = None
+        self.download_source = None
+        self.download_region_path = None
+        options = region_menu_options(regions_asset)
+        selected = next((value for _, value in options if str(value) == '7'), options[0][1])
+        self.region = widgets.Dropdown(options=options, value=selected, description='Región:',
+                                       layout=widgets.Layout(width='100%'))
+        self.year = widgets.Dropdown(options=list(range(date.today().year, 2016, -1)),
+                                     value=date.today().year, description='Año:')
+        months = ('Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+                  'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre')
+        self.month = widgets.Dropdown(options=[(name, i) for i, name in enumerate(months, 1)],
+                                      value=1, description='Mes:')
+        self.source = widgets.Dropdown(options=[('Planetary Computer', 'planetary-computer'),
+                                                ('Earth Search', 'earth-search')],
+                                       value='planetary-computer', description='Fuente:')
+        self.test_mode = widgets.Checkbox(value=True, description='Modo de prueba: máximo 10 escenas', indent=False)
+        self.download_button = widgets.Button(description='Descargar', icon='download', button_style='success')
+        self.output = widgets.Output()
+        self.status = widgets.HTML('Seleccione región, año, mes y fuente. Pulse Descargar para empezar.')
+        self.panel = widgets.VBox([
+            widgets.HTML('<h3 style="color:#185c44;margin:0">Descargar escenas del mes</h3>'),
+            self.region, widgets.HBox([self.year, self.month, self.source],
+                                      layout=widgets.Layout(flex_flow='row wrap')),
+            self.test_mode, self.download_button, self.status, self.output,
+        ], layout=widgets.Layout(border='1px solid #cbded5', padding='18px', width='100%'))
+        self.download_button.on_click(self._download)
+
+    def parameters(self):
+        year, month = self.year.value, self.month.value
+        return {'regions_asset': self.regions_asset, 'tiles_asset': self.tiles_asset,
+                'region_id': self.region.value, 'start_date': date(year, month, 1).isoformat(),
+                'end_date': date(year + (month == 12), 1 if month == 12 else month + 1, 1).isoformat()}
+
+    def _download(self, _=None):
+        controls = (self.region, self.year, self.month, self.source, self.test_mode, self.download_button)
+        parameters = self.parameters()
+        source, test_mode = self.source.value, self.test_mode.value
+        self.result = self.download_parameters = self.download_source = self.download_region_path = None
+        self.output.clear_output()
+        for control in controls:
+            control.disabled = True
+        self.status.value = 'Consultando blocklist y descargando escenas…'
+        try:
+            with self.output:
+                result = download_month(self.workflow, parameters, source=source, test_mode=test_mode)
+            self.result = result
+            self.download_parameters = parameters
+            self.download_source = source
+            self.download_region_path = Path(self.workflow.regions_path)
+            count = len(result['result'].paths) if result.get('result') is not None else 0
+            self.status.value = f'Descarga terminada: {count} escenas. Puede ejecutar la siguiente celda de procesamiento.' if count else 'Sin escenas descargadas para esta selección.'
+        except Exception as exc:
+            self.status.value = 'No se pudo completar la descarga. Revise el mensaje de abajo.'
+            with self.output:
+                print(str(exc))
+        finally:
+            for control in controls:
+                control.disabled = False
+
+    def show(self):
+        from IPython.display import display
+        display(self.panel)
+        return self
+
+
+def run_monthly_download_ui(workflow, *, regions_asset, tiles_asset):
+    return MonthlyDownloadUI(workflow, regions_asset, tiles_asset).show()

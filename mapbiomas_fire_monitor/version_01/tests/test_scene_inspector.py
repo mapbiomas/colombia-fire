@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 CORE = Path(__file__).resolve().parents[1] / 'src/core'
 sys.path.insert(0, str(CORE))
-from M_scene_inspector import SceneInspectionSession, SceneInspectorUI, match_selected_scenes, filter_blocklisted_scenes, download_month
+from M_scene_inspector import DOWNLOAD_BANDS, SceneInspectionSession, SceneInspectorUI, MonthlyDownloadUI, match_selected_scenes, filter_blocklisted_scenes, download_month
 
 
 class SceneInspectorTests(unittest.TestCase):
@@ -85,12 +85,13 @@ class SceneInspectorTests(unittest.TestCase):
         chosen, other = self.item(), self.item('item2', product='PRODUCT_B')
         self.pipeline.search_scenes.return_value.items = [chosen, other]
         with tempfile.TemporaryDirectory() as temp:
-            config = types.SimpleNamespace(output_dir=Path(temp), bands=['red', 'nir', 'swir16', 'swir22', 'scl'])
+            config = types.SimpleNamespace(output_dir=Path(temp), bands=list(DOWNLOAD_BANDS))
             self.pipeline.PipelineConfig.return_value = config
             result = self.session.download([self.row['id']], 'earth-search')
             self.workflow.load_gee_vectors.assert_called_once_with(self.params)
             self.pipeline.download_scenes.assert_called_once_with(config, [chosen])
             self.assertIs(result, self.pipeline.download_scenes.return_value)
+            self.assertEqual(self.pipeline.PipelineConfig.call_args.kwargs['bands'], DOWNLOAD_BANDS)
             self.assertNotIn('max_cloud_cover', self.pipeline.PipelineConfig.call_args.kwargs)
             self.assertFalse(self.pipeline.search_scenes.call_args.kwargs['filter_cloud_cover'])
             self.assertEqual(self.pipeline.PipelineConfig.call_args.kwargs['end_date'], '2026-01-31')
@@ -195,7 +196,7 @@ class SceneInspectorTests(unittest.TestCase):
             scenes.append(dict(self.row, id=f'COPERNICUS/S2_SR_HARMONIZED/{stamp}_20260112T170000_T18NZL',
                                time=self.time + i * 1000, product_id=f'PRODUCT_{i}'))
             items.append(self.item(f'item{i}', product=f'PRODUCT_{i}', date=instant.isoformat()))
-        config = types.SimpleNamespace(output_dir=Path(root), bands=['red', 'nir', 'swir16', 'swir22'])
+        config = types.SimpleNamespace(output_dir=Path(root), bands=list(DOWNLOAD_BANDS))
         self.pipeline.PipelineConfig.return_value = config
         self.pipeline.search_scenes.return_value.items = items
         blocklists = types.ModuleType('M_blocklist')
@@ -215,6 +216,9 @@ class SceneInspectorTests(unittest.TestCase):
                 report = download_month(self.workflow, self.params, test_mode=True)
             selected = self.pipeline.download_scenes.call_args.args[1]
             self.assertEqual(selected, items[2:12])
+            self.assertEqual(self.pipeline.PipelineConfig.call_args.kwargs['bands'],
+                             ('coastal', 'blue', 'green', 'red', 'rededge1', 'rededge2', 'rededge3',
+                              'nir', 'nir08', 'nir09', 'swir16', 'swir22', 'scl'))
             self.assertEqual(len(report['selected']), 10)
             self.assertEqual(len(report['excluded']), 2)
             self.assertIn(scenes[0]['id'], output.getvalue())
@@ -262,6 +266,51 @@ class SceneInspectorTests(unittest.TestCase):
         allowed, excluded = filter_blocklisted_scenes(scenes, [blocked])
         self.assertEqual(allowed, scenes[2:])
         self.assertEqual(len(excluded), 2)
+
+    def make_monthly_ui(self):
+        # Reuse the lightweight widget stand-ins installed by the existing UI tests.
+        self.make_ui()
+        with patch('M_scene_inspector.region_menu_options', return_value=[('7 · Región 7', 7), ('8 · Región 8', 8)]):
+            return MonthlyDownloadUI(self.workflow, 'regions', 'tiles')
+
+    def test_monthly_menu_starts_download_only_on_click(self):
+        with patch('M_scene_inspector.download_month') as download:
+            ui = self.make_monthly_ui()
+            download.assert_not_called()
+            ui.year.value = 2026
+            ui.month.value = 12
+            ui.region.value = 8
+            ui.source.value = 'earth-search'
+            ui.test_mode.value = True
+            download.return_value = {'result': types.SimpleNamespace(paths={'scene': {}})}
+            ui._download()
+            download.assert_called_once_with(self.workflow, {
+                'regions_asset': 'regions', 'tiles_asset': 'tiles', 'region_id': 8,
+                'start_date': '2026-12-01', 'end_date': '2027-01-01',
+            }, source='earth-search', test_mode=True)
+            self.assertIs(ui.result, download.return_value)
+            self.assertFalse(ui.download_button.disabled)
+
+    def test_processing_snapshot_is_unchanged_when_menu_options_change(self):
+        ui = self.make_monthly_ui()
+        ui.year.value, ui.month.value = 2026, 1
+        with patch('M_scene_inspector.download_month', return_value={'result': types.SimpleNamespace(paths={'scene': {}})}):
+            ui._download()
+        ui.month.value, ui.region.value, ui.source.value = 2, 8, 'earth-search'
+        self.assertEqual(ui.download_parameters['start_date'], '2026-01-01')
+        self.assertEqual(ui.download_parameters['region_id'], 7)
+        self.assertEqual(ui.download_source, 'planetary-computer')
+        self.assertEqual(ui.parameters()['start_date'], '2026-02-01')
+
+    def test_failed_download_clears_previous_result_and_reenables_menu(self):
+        ui = self.make_monthly_ui()
+        ui.result = {'result': 'previous'}
+        with patch('M_scene_inspector.download_month', side_effect=RuntimeError('No access')):
+            ui._download()
+        self.assertIsNone(ui.result)
+        self.assertIsNone(ui.download_parameters)
+        self.assertFalse(ui.download_button.disabled)
+        self.assertFalse(ui.region.disabled)
 
 
 if __name__ == '__main__':
