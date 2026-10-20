@@ -40,9 +40,6 @@ class MonthlyMosaicSession:
         image = get_quality_mosaic('sentinel2', year, start, end, geometry,
                                    month=month, method=method)
         # Evaluate before enabling exports, including Cloud Score / buffer errors.
-        names = image.bandNames().getInfo()
-        if not set(BANDS).issubset(names):
-            raise ValueError('El mosaico no contiene las siete bandas esperadas.')
         if not image.select('red').getMapId({'min': 0, 'max': 40}):
             raise ValueError('No se pudo preparar la vista del mosaico.')
         self.prepared = dict(year=year, month=month, method=method, image=image,
@@ -100,7 +97,6 @@ class MonthlyMosaicUI:
         self.month = widgets.Dropdown(options=[(m, i) for i, m in enumerate(MONTHS, 1)],
                                       description='Mes:')
         self.method = widgets.Dropdown(options=[(m.upper(), m) for m in methods], description='Mosaico:')
-        self.bands = widgets.SelectMultiple(options=BANDS, value=BANDS, description='Bandas:', rows=7)
         self.asset = widgets.Checkbox(value=True, description='GEE Assets', indent=False)
         self.gcs = widgets.Checkbox(value=True, description='Google Cloud Storage', indent=False)
         self.preview_button = widgets.Button(description='Preparar y visualizar', icon='map', button_style='info')
@@ -113,10 +109,10 @@ class MonthlyMosaicUI:
         self.task_table = widgets.HTML()
         self.panel = widgets.VBox([
             widgets.HTML('<h3 style="color:#185c44;margin:0">Mosaico mensual · Sentinel-2</h3>'
-                         '<p>Seleccione un mes completo, visualice el mosaico y exporte las bandas elegidas.</p>'),
+                         '<p>Seleccione un mes completo, visualice el mosaico y exporte todas las bandas.</p>'),
             widgets.HBox([self.year, self.month, self.method], layout=widgets.Layout(flex_flow='row wrap')),
             self.summary,
-            widgets.HBox([self.bands, widgets.VBox([self.asset, self.gcs])]),
+            widgets.HBox([self.asset, self.gcs]),
             widgets.HBox([self.preview_button, self.export_button, self.refresh_button],
                          layout=widgets.Layout(flex_flow='row wrap')),
             self.messages, self.map_output, self.task_table,
@@ -141,12 +137,12 @@ class MonthlyMosaicUI:
         self.summary.value = (
             f'<p><b>Colombia · {start} → {end} (fin exclusivo) · 10 m</b><br>'
             'Cloud Score Plus ≥ 0.40 · Reflectancia almacenada en byte (0–100) · '
-            'Una tarea por banda y destino.<br>'
+            'Todas las bandas · Una tarea por banda y destino.<br>'
             f'GEE: <code>{escape(asset_path)}/&lt;banda&gt;</code><br>'
             f'GCS: <code>gs://{escape(config.CONFIG["bucket"])}/{escape(gcs_path)}</code></p>')
 
     def _busy(self, busy):
-        for control in (self.year, self.month, self.method, self.bands, self.asset,
+        for control in (self.year, self.month, self.method, self.asset,
                         self.gcs, self.preview_button, self.refresh_button):
             control.disabled = busy
         self.export_button.disabled = busy or self.session.prepared is None
@@ -184,7 +180,7 @@ class MonthlyMosaicUI:
         self.messages.clear_output()
         try:
             destinations = [name for name, selected in (('ASSET', self.asset.value), ('GCS', self.gcs.value)) if selected]
-            errors = self.session.export(self.bands.value, destinations)
+            errors = self.session.export(BANDS, destinations)
             with self.messages:
                 print('Envío terminado. Consulte el estado de cada tarea abajo.')
                 for error in errors:

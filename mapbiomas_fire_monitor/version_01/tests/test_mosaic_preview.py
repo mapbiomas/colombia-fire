@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 CORE = Path(__file__).resolve().parents[1] / 'src/core'
 sys.path.insert(0, str(CORE))
-from M1_mosaic_preview_ui import MonthlyMosaicSession, month_dates
+from M1_mosaic_preview_ui import BANDS, MonthlyMosaicSession, MonthlyMosaicUI, month_dates
 
 
 class MonthlyMosaicTests(unittest.TestCase):
@@ -50,10 +50,23 @@ class MonthlyMosaicTests(unittest.TestCase):
         self.logic.get_quality_mosaic.assert_called_once_with(
             'sentinel2', 2025, '2025-01-01', '2025-02-01',
             self.config.get_country_geometry.return_value, month=1, method='minnbr')
+        self.image.bandNames.assert_not_called()
         for fn in (self.logic.export_to_asset, self.logic.export_to_gcs):
             for call in fn.call_args_list:
                 self.assertIs(call.args[0], self.image)
         self.assertFalse(self.logic.export_to_asset.call_args.kwargs['overwrite'])
+
+    def test_interface_exports_all_bands_without_a_band_selector(self):
+        ui = MonthlyMosaicUI.__new__(MonthlyMosaicUI)
+        ui.session = MagicMock()
+        ui.session.export.return_value = []
+        ui.asset = types.SimpleNamespace(value=True)
+        ui.gcs = types.SimpleNamespace(value=True)
+        ui.messages = MagicMock()
+        ui._busy = MagicMock()
+        ui._refresh = MagicMock()
+        ui._export()
+        ui.session.export.assert_called_once_with(BANDS, ['ASSET', 'GCS'])
 
     def test_cannot_export_before_preview_or_after_config_change(self):
         with self.assertRaises(ValueError):
